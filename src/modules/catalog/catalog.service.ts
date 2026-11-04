@@ -1,4 +1,7 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, OnModuleInit } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
+import { MatrixSystemEntity } from './entities/matrix-system.entity.js';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -10,50 +13,33 @@ export interface SavedMatrixSystem {
 }
 
 @Injectable()
-export class CatalogService {
-  private readonly filePath = path.join(process.cwd(), 'data', 'catalog.json');
+export class CatalogService implements OnModuleInit {
+  constructor(
+    @InjectRepository(MatrixSystemEntity)
+    private readonly matrixRepo: Repository<MatrixSystemEntity>,
+  ) {}
 
-  private readCatalogFile(): SavedMatrixSystem[] {
-    const dir = path.dirname(this.filePath);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-    if (!fs.existsSync(this.filePath)) {
-      fs.writeFileSync(this.filePath, JSON.stringify([], null, 2), 'utf-8');
-      return [];
-    }
-    try {
-      const raw = fs.readFileSync(this.filePath, 'utf-8');
-      const parsed: SavedMatrixSystem[] = JSON.parse(raw || '[]');
-      // Автоматически отсеиваем поврежденные/пустые матрицы без строк
-      return parsed.filter(
-        (sys) =>
-          Array.isArray(sys.sheets) &&
-          sys.sheets.some((sh) => Array.isArray(sh.rows) && sh.rows.length > 0),
-      );
-    } catch {
-      return [];
-    }
+  async onModuleInit(): Promise<void> {
   }
 
-  private writeCatalogFile(list: SavedMatrixSystem[]): void {
-    fs.writeFileSync(this.filePath, JSON.stringify(list, null, 2), 'utf-8');
+
+  async getAllSystems(): Promise<SavedMatrixSystem[]> {
+    const list = await this.matrixRepo.find();
+    return list.filter(
+      (sys) =>
+        Array.isArray(sys.sheets) &&
+        sys.sheets.some((sh) => Array.isArray(sh.rows) && sh.rows.length > 0),
+    );
   }
 
-  getAllSystems(): SavedMatrixSystem[] {
-    const valid = this.readCatalogFile();
-    this.writeCatalogFile(valid);
-    return valid;
-  }
-
-  saveSystem(name: string, sheets: any[]): SavedMatrixSystem {
+  async saveSystem(name: string, sheets: any[]): Promise<SavedMatrixSystem> {
     const cleanName = (name || 'Матрица').trim();
-    const list = this.readCatalogFile();
-    const existingIdx = list.findIndex(
+    const list = await this.matrixRepo.find();
+    const existing = list.find(
       (s) => s.name.toLowerCase() === cleanName.toLowerCase(),
     );
 
-    const sysId = existingIdx >= 0 ? list[existingIdx].id : `sys_${Date.now()}`;
+    const sysId = existing ? existing.id : `sys_${Date.now()}`;
 
     const normalizedSheets = (sheets || [])
       .filter((sh) => Array.isArray(sh.rows) && sh.rows.length > 0)
@@ -69,7 +55,9 @@ export class CatalogService {
       }));
 
     const totalRows = normalizedSheets.reduce((acc, s) => acc + s.rows.length, 0);
-    console.log(`[Catalog] Сохранена матрица "${cleanName}" (листов: ${normalizedSheets.length}, строк: ${totalRows})`);
+    console.log(
+      `[Catalog] Сохранена матрица "${cleanName}" в БД (листов: ${normalizedSheets.length}, строк: ${totalRows})`,
+    );
 
     const record: SavedMatrixSystem = {
       id: sysId,
@@ -78,21 +66,14 @@ export class CatalogService {
       sheets: normalizedSheets,
     };
 
-    if (existingIdx >= 0) {
-      list[existingIdx] = record;
-    } else {
-      list.push(record);
-    }
-
-    this.writeCatalogFile(list);
+    await this.matrixRepo.save(record);
     return record;
   }
 
-  deleteSystem(id: string): { deleted: boolean } {
-    const list = this.readCatalogFile();
-    const filtered = list.filter((s) => s.id !== id);
-    this.writeCatalogFile(filtered);
-    console.log(`[Catalog] Удалена матрица ID=${id}`);
-    return { deleted: filtered.length < list.length };
+  async deleteSystem(id: string): Promise<{ deleted: boolean }> {
+    const result = await this.matrixRepo.delete(id);
+    const deleted = (result.affected ?? 0) > 0;
+    console.log(`[Catalog] Удалена матрица ID=${id} из БД (успешно: ${deleted})`);
+    return { deleted };
   }
 }

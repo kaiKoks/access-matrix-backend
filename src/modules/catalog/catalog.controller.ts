@@ -6,17 +6,17 @@ export class CatalogController {
   constructor(private readonly catalogService: CatalogService) {}
 
   @Get()
-  getAll() {
+  async getAll() {
     return this.catalogService.getAllSystems();
   }
 
   @Post()
-  save(@Body() body: { name: string; sheets: any[] }) {
+  async save(@Body() body: { name: string; sheets: any[] }) {
     return this.catalogService.saveSystem(body.name, body.sheets);
   }
 
   @Delete(':id')
-  remove(@Param('id') id: string) {
+  async remove(@Param('id') id: string) {
     return this.catalogService.deleteSystem(id);
   }
 }

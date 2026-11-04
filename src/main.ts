@@ -25,4 +25,4 @@ async function bootstrap() {
   await app.listen(port);
   console.log(`=== Бэкенд успешно запущен на http://localhost:${port} ===`);
 }
-bootstrap();
+void bootstrap();
