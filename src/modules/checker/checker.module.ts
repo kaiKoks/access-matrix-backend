@@ -1,14 +1,10 @@
-import { Body, Controller, Post } from '@nestjs/common';
+import { Module } from '@nestjs/common';
+import { CheckerController } from './checker.controller.js';
 import { CheckerService } from './checker.service.js';
-import { CheckRuleRequestDto, CheckRuleResponseDto } from '../../common/dto/check-rule.dto.js';
+import { ZabbixApiService } from './zabbix-api.service.js';
 
-@Controller('api/checker')
-export class CheckerController {
-  constructor(private readonly checkerService: CheckerService) {}
-
-  @Post('test-rule')
-  async testRule(@Body() dto: CheckRuleRequestDto): Promise<CheckRuleResponseDto> {
-    return this.checkerService.checkRule(dto);
-  }
-}
+@Module({
+  controllers: [CheckerController], 
+  providers: [CheckerService, ZabbixApiService],
+})
 export class CheckerModule {}
