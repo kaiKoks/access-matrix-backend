@@ -1,6 +1,4 @@
-import { Injectable } from '@nestjs/common';
-import * as net from 'net';
-import * as dgram from 'dgram';
+import { Injectable, BadGatewayException, BadRequestException } from '@nestjs/common';
 import { ZabbixApiService } from './zabbix-api.service.js';
 import {
   CheckRuleRequestDto,
@@ -22,23 +20,43 @@ interface RawCombination {
 export class CheckerService {
   constructor(private readonly zabbixApi: ZabbixApiService) {}
 
-  // Извлекает чистый IP или FQDN из строк вида "10.194.199.11/alt1-dc01.interrao.ru." или URL
+  // Извлекает рабочий IP или FQDN из подсетей (10.194.194.0/24 -> 10.194.194.1),
+  // диапазонов (10.196.160.1-10.196.175.238 -> 10.196.160.1) и записей IP/DNS
   private extractCleanHost(rawEndpoint: string): string {
-    const cleaned = rawEndpoint.trim();
+    let cleaned = rawEndpoint.trim();
+
     if (/^https?:\/\//i.test(cleaned)) {
       try {
-        return new URL(cleaned).hostname;
+        cleaned = new URL(cleaned).hostname;
       } catch {
         // ignore
       }
     }
-    if (cleaned.includes('/')) {
-      return cleaned.split('/')[0].trim();
+
+    // 1. Обработка CIDR-подсетей вида "10.194.194.0/24" -> берем первый адрес "10.194.194.1"
+    const cidrMatch = cleaned.match(/^(\d{1,3}\.\d{1,3}\.\d{1,3})\.(\d{1,3})\/\d{1,2}$/);
+    if (cidrMatch) {
+      const lastOctet = parseInt(cidrMatch[2], 10);
+      return `${cidrMatch[1]}.${lastOctet === 0 ? 1 : lastOctet}`;
     }
+
+    // 2. Обработка записей через слэш вида "10.132.34.80/msk1-trpomgr01.interrao.ru."
+    if (cleaned.includes('/')) {
+      cleaned = cleaned.split('/')[0].trim();
+    }
+
+    // 3. Обработка диапазонов IP вида "10.196.160.1-10.196.175.238" -> берем первый IP
+    if (cleaned.includes('-')) {
+      const firstIp = cleaned.split('-')[0].trim();
+      if (/^\d{1,3}(\.\d{1,3}){3}$/.test(firstIp)) {
+        return firstIp;
+      }
+    }
+
     return cleaned.replace(/\.$/, '');
   }
 
-  // Разворачивает короткие диапазоны портов ("15000-15001" -> ["15000", "15001"])
+  // Разворачивает диапазоны портов ("15000-15001" -> ["15000", "15001"])
   private expandPortToken(token: string): string[] {
     const clean = token.replace(/^(tcp|udp)\//i, '').trim();
     const rangeMatch = clean.match(/^(\d+)\s*[–-]\s*(\d+)$/);
@@ -54,7 +72,6 @@ export class CheckerService {
     return /^\d+$/.test(clean) ? [clean] : [];
   }
 
-  // Строит все комбинации Source × Destination × Port
   private buildCombinations(dto: CheckRuleRequestDto): RawCombination[] {
     const sources = dto.sources?.length ? dto.sources : ['LocalHost'];
     const destinations = dto.destinations?.length ? dto.destinations : ['Unknown'];
@@ -69,10 +86,11 @@ export class CheckerService {
             const expanded = this.expandPortToken(rawPort);
 
             for (const port of expanded) {
+              // Формируем универсальный ключ с реальным целевым IP без лишних пробелов
               const zabbixKey =
                 portGroup.protocol === 'UDP'
-                  ? `custom.udp.port[${port}]`
-                  : `net.tcp.port[127.0.0.1, ${port}]`;
+                  ? `custom.udp.check[${cleanDestHost},${port}]`
+                  : `net.tcp.port[${cleanDestHost},${port}]`;
 
               combinations.push({
                 id: `${src}->${dst}:${port}/${portGroup.protocol}`,
@@ -93,68 +111,49 @@ export class CheckerService {
   }
 
   async checkRule(dto: CheckRuleRequestDto): Promise<CheckRuleResponseDto> {
-    const mode = dto.mode || (process.env.CHECKER_MODE as any) || 'mock';
+    const mode = dto.mode || (process.env.CHECKER_MODE as 'zabbix' | 'mock') || 'mock';
     const combinations = this.buildCombinations(dto);
 
-    if (mode === 'zabbix') {
-      try {
-        return await this.checkViaZabbixApi(combinations);
-      } catch (err: any) {
-        // Если Zabbix-сервер еще не развернут, возвращаем эмуляцию с пометкой в логе
-        const fallback = await this.checkViaMock(combinations);
-        fallback.log =
-          `[ВНИМАНИЕ] Zabbix API недоступен (${err.message}). Выполнен отказоустойчивый переход в режим эмуляции.\n\n` +
-          fallback.log;
-        return fallback;
-      }
+    if (combinations.length === 0) {
+      throw new BadRequestException('В правиле не найдено корректных IP и портов для проверки');
     }
 
-    if (mode === 'socket') {
-      return await this.checkViaDirectSockets(combinations);
+    // Никакого перехода на mock при ошибке: в режиме zabbix любая проблема выбрасывает исключение
+    if (mode === 'zabbix') {
+      return await this.checkViaZabbixApi(combinations);
     }
 
     return await this.checkViaMock(combinations);
   }
 
-  // 1. Боевой опрос через Zabbix API (JSON-RPC 2.0 method: "item.get")
+  // 1. Боевой опрос через Zabbix API с автосозданием недостающих элементов на узле-сканере
   private async checkViaZabbixApi(combinations: RawCombination[]): Promise<CheckRuleResponseDto> {
+    const scannerHost = await this.zabbixApi.resolveScannerHost();
+    const allKeys = combinations.map((c) => c.zabbixKey);
+
+    const itemsMap = await this.zabbixApi.ensureAndFetchItems(scannerHost, allKeys);
+
     const socketResults: SocketCheckItem[] = [];
     const nowUnix = Math.floor(Date.now() / 1000);
     const logLines: string[] = [
-      `[${new Date().toLocaleTimeString()}] Zabbix API JSON-RPC 2.0 (method: "item.get")`,
+      `[${new Date().toLocaleTimeString()}] Zabbix API JSON-RPC 2.0 (Узел-сканер: ${scannerHost.host}, hostid=${scannerHost.hostid})`,
       `Проверено связок (IP × Порт): ${combinations.length}`,
       `------------------------------------------------------------`,
     ];
 
-    // Кэшируем найденные hostid и их items, чтобы не делать лишних запросов для одного хоста
-    const hostItemsCache = new Map<string, Map<string, { lastvalue: string; lastclock: number }>>();
-
     for (const combo of combinations) {
-      const cacheKey = `${combo.cleanDestHost}_${combo.protocol}`;
-
-      if (!hostItemsCache.has(cacheKey)) {
-        const itemsMap = new Map<string, { lastvalue: string; lastclock: number }>();
-        const hostId = await this.zabbixApi.findHostId(combo.cleanDestHost);
-
-        if (hostId) {
-          const items = await this.zabbixApi.getHostPortItems(hostId, combo.protocol);
-          items.forEach((item) => {
-            itemsMap.set(item.key_.replace(/\s+/g, ''), {
-              lastvalue: item.lastvalue,
-              lastclock: parseInt(item.lastclock, 10) || nowUnix,
-            });
-          });
-        }
-        hostItemsCache.set(cacheKey, itemsMap);
-      }
-
-      const itemsMap = hostItemsCache.get(cacheKey)!;
       const normalizedLookupKey = combo.zabbixKey.replace(/\s+/g, '');
       const foundItem = itemsMap.get(normalizedLookupKey);
 
-      const isOpen = foundItem?.lastvalue === '1';
+      if (!foundItem) {
+        throw new BadGatewayException(
+          `Элемент данных "${combo.zabbixKey}" не удалось получить с узла-сканера (hostid=${scannerHost.hostid})`,
+        );
+      }
+
+      const isOpen = foundItem.lastvalue === '1';
       const lastvalue: '1' | '0' = isOpen ? '1' : '0';
-      const lastclock = foundItem?.lastclock || nowUnix;
+      const lastclock = parseInt(foundItem.lastclock, 10) || nowUnix;
 
       socketResults.push({
         id: combo.id,
@@ -173,7 +172,7 @@ export class CheckerService {
         : `${combo.destination}:${combo.port}`;
 
       logLines.push(
-        `[${combo.protocol}] ${combo.source} -> ${destWithPort}\n` +
+        `[${combo.protocol}] ${combo.source} -> ${destWithPort} (проверен IP: ${combo.cleanDestHost})\n` +
           `  key_: "${combo.zabbixKey}" | lastvalue: "${lastvalue}" | lastclock: ${new Date(
             lastclock * 1000,
           ).toLocaleTimeString()}`,
@@ -190,14 +189,14 @@ export class CheckerService {
     };
   }
 
-  // 2. Режим эмуляции Zabbix API (для локальной отладки и демонстрации)
+  // 2. Режим эмуляции Zabbix API (работает ТОЛЬКО когда явно выбран режим mock)
   private async checkViaMock(combinations: RawCombination[]): Promise<CheckRuleResponseDto> {
     await new Promise((r) => setTimeout(r, 200 + Math.random() * 250));
 
     const nowUnix = Math.floor(Date.now() / 1000);
     const socketResults: SocketCheckItem[] = [];
     const logLines: string[] = [
-      `[${new Date().toLocaleTimeString()}] POST /zabbix/api_jsonrpc.php (method: "item.get")`,
+      `[${new Date().toLocaleTimeString()}] РЕЖИМ ЭМУЛЯЦИИ (MOCK)`,
       `Проверено связок (IP × Порт): ${combinations.length}`,
       `------------------------------------------------------------`,
     ];
@@ -224,7 +223,7 @@ export class CheckerService {
         : `${combo.destination}:${combo.port}`;
 
       logLines.push(
-        `[${combo.protocol}] ${combo.source} -> ${destWithPort}\n` +
+        `[${combo.protocol}] ${combo.source} -> ${destWithPort} (IP: ${combo.cleanDestHost})\n` +
           `  key_: "${combo.zabbixKey}" | lastvalue: "${lastvalue}" | lastclock: ${new Date(
             lastclock * 1000,
           ).toLocaleTimeString()}`,
@@ -239,95 +238,5 @@ export class CheckerService {
       log: logLines.join('\n'),
       checkedAt: new Date().toLocaleTimeString(),
     };
-  }
-
-  // 3. Резервный режим прямой проверки сокетов с сервера бэкенда
-  private async checkViaDirectSockets(
-    combinations: RawCombination[],
-  ): Promise<CheckRuleResponseDto> {
-    const socketResults: SocketCheckItem[] = [];
-    const nowUnix = Math.floor(Date.now() / 1000);
-    const logLines: string[] = [
-      `[${new Date().toLocaleTimeString()}] Прямая проверка сокетов (Direct Socket Mode)`,
-      `Проверено связок: ${combinations.length}`,
-      `------------------------------------------------------------`,
-    ];
-
-    for (const combo of combinations) {
-      const portNum = parseInt(combo.port, 10) || 80;
-      const isOpen =
-        combo.protocol === 'UDP'
-          ? await this.testUdpSocket(combo.cleanDestHost, portNum)
-          : await this.testTcpSocket(combo.cleanDestHost, portNum);
-
-      const lastvalue: '1' | '0' = isOpen ? '1' : '0';
-
-      socketResults.push({
-        id: combo.id,
-        source: combo.source,
-        destination: combo.destination,
-        port: combo.port,
-        protocol: combo.protocol,
-        zabbixKey: combo.zabbixKey,
-        lastvalue,
-        lastclock: nowUnix,
-        status: isOpen ? 'accessible' : 'blocked',
-      });
-
-      logLines.push(
-        `[${combo.protocol}] ${combo.source} -> ${combo.cleanDestHost}:${portNum} | lastvalue: "${lastvalue}"`,
-      );
-    }
-
-    const hasAtLeastOneOpen = socketResults.some((s) => s.status === 'accessible');
-
-    return {
-      status: hasAtLeastOneOpen ? 'accessible' : 'blocked',
-      socketResults,
-      log: logLines.join('\n'),
-      checkedAt: new Date().toLocaleTimeString(),
-    };
-  }
-
-  private testTcpSocket(host: string, port: number, timeout = 2000): Promise<boolean> {
-    return new Promise((resolve) => {
-      const socket = new net.Socket();
-      socket.setTimeout(timeout);
-      socket.on('connect', () => {
-        socket.destroy();
-        resolve(true);
-      });
-      socket.on('timeout', () => {
-        socket.destroy();
-        resolve(false);
-      });
-      socket.on('error', () => {
-        socket.destroy();
-        resolve(false);
-      });
-      socket.connect(port, host);
-    });
-  }
-
-  private testUdpSocket(host: string, port: number, timeout = 1500): Promise<boolean> {
-    return new Promise((resolve) => {
-      const client = dgram.createSocket('udp4');
-      const timer = setTimeout(() => {
-        client.close();
-        resolve(true);
-      }, timeout);
-      client.on('error', () => {
-        clearTimeout(timer);
-        client.close();
-        resolve(false);
-      });
-      client.send(Buffer.from('\x00'), port, host, (err) => {
-        if (err) {
-          clearTimeout(timer);
-          client.close();
-          resolve(false);
-        }
-      });
-    });
   }
 }
