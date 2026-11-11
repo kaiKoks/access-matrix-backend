@@ -20,8 +20,8 @@ interface RawCombination {
 export class CheckerService {
   constructor(private readonly zabbixApi: ZabbixApiService) {}
 
-  // Извлекает рабочий IP или FQDN из подсетей (10.194.194.0/24 -> 10.194.194.1),
-  // диапазонов (10.196.160.1-10.196.175.238 -> 10.196.160.1) и записей IP/DNS
+  // Извлекает чистый рабочий IP или FQDN из подсетей (10.194.194.0/24 -> 10.194.194.1),
+  // диапазонов (10.196.160.1-10.196.175.238 -> 10.196.160.1) и записей вида IP/DNS
   private extractCleanHost(rawEndpoint: string): string {
     let cleaned = rawEndpoint.trim();
 
@@ -33,19 +33,16 @@ export class CheckerService {
       }
     }
 
-    // 1. Обработка CIDR-подсетей вида "10.194.194.0/24" -> берем первый адрес "10.194.194.1"
     const cidrMatch = cleaned.match(/^(\d{1,3}\.\d{1,3}\.\d{1,3})\.(\d{1,3})\/\d{1,2}$/);
     if (cidrMatch) {
       const lastOctet = parseInt(cidrMatch[2], 10);
       return `${cidrMatch[1]}.${lastOctet === 0 ? 1 : lastOctet}`;
     }
 
-    // 2. Обработка записей через слэш вида "10.132.34.80/msk1-trpomgr01.interrao.ru."
     if (cleaned.includes('/')) {
       cleaned = cleaned.split('/')[0].trim();
     }
 
-    // 3. Обработка диапазонов IP вида "10.196.160.1-10.196.175.238" -> берем первый IP
     if (cleaned.includes('-')) {
       const firstIp = cleaned.split('-')[0].trim();
       if (/^\d{1,3}(\.\d{1,3}){3}$/.test(firstIp)) {
@@ -56,7 +53,6 @@ export class CheckerService {
     return cleaned.replace(/\.$/, '');
   }
 
-  // Разворачивает диапазоны портов ("15000-15001" -> ["15000", "15001"])
   private expandPortToken(token: string): string[] {
     const clean = token.replace(/^(tcp|udp)\//i, '').trim();
     const rangeMatch = clean.match(/^(\d+)\s*[–-]\s*(\d+)$/);
@@ -86,7 +82,6 @@ export class CheckerService {
             const expanded = this.expandPortToken(rawPort);
 
             for (const port of expanded) {
-              // Формируем универсальный ключ с реальным целевым IP без лишних пробелов
               const zabbixKey =
                 portGroup.protocol === 'UDP'
                   ? `custom.udp.check[${cleanDestHost},${port}]`
@@ -111,14 +106,15 @@ export class CheckerService {
   }
 
   async checkRule(dto: CheckRuleRequestDto): Promise<CheckRuleResponseDto> {
-    const mode = dto.mode || (process.env.CHECKER_MODE as 'zabbix' | 'mock') || 'mock';
+    // Режим определяется строго настройкой CHECKER_MODE в backend/.env
+    const mode = (process.env.CHECKER_MODE || 'mock').trim().toLowerCase();
     const combinations = this.buildCombinations(dto);
 
     if (combinations.length === 0) {
       throw new BadRequestException('В правиле не найдено корректных IP и портов для проверки');
     }
 
-    // Никакого перехода на mock при ошибке: в режиме zabbix любая проблема выбрасывает исключение
+    // В режиме zabbix никаких откатов к мокам нет: любая ошибка пробрасывается на фронтенд
     if (mode === 'zabbix') {
       return await this.checkViaZabbixApi(combinations);
     }
@@ -126,20 +122,20 @@ export class CheckerService {
     return await this.checkViaMock(combinations);
   }
 
-  // 1. Боевой опрос через Zabbix API с автосозданием недостающих элементов на узле-сканере
   private async checkViaZabbixApi(combinations: RawCombination[]): Promise<CheckRuleResponseDto> {
     const scannerHost = await this.zabbixApi.resolveScannerHost();
     const allKeys = combinations.map((c) => c.zabbixKey);
 
-    const itemsMap = await this.zabbixApi.ensureAndFetchItems(scannerHost, allKeys);
+    const itemsMap = await this.zabbixApi.ensureAndPollItems(scannerHost, allKeys);
 
     const socketResults: SocketCheckItem[] = [];
-    const nowUnix = Math.floor(Date.now() / 1000);
     const logLines: string[] = [
       `[${new Date().toLocaleTimeString()}] Zabbix API JSON-RPC 2.0 (Узел-сканер: ${scannerHost.host}, hostid=${scannerHost.hostid})`,
       `Проверено связок (IP × Порт): ${combinations.length}`,
       `------------------------------------------------------------`,
     ];
+
+    const pendingKeys: string[] = [];
 
     for (const combo of combinations) {
       const normalizedLookupKey = combo.zabbixKey.replace(/\s+/g, '');
@@ -147,13 +143,24 @@ export class CheckerService {
 
       if (!foundItem) {
         throw new BadGatewayException(
-          `Элемент данных "${combo.zabbixKey}" не удалось получить с узла-сканера (hostid=${scannerHost.hostid})`,
+          `Элемент данных "${combo.zabbixKey}" не найден в Zabbix после создания`,
         );
+      }
+
+      // Если элемент в Zabbix перешел в состояние Not Supported (state === '1'), сообщаем точную причину
+      if (foundItem.state === '1') {
+        throw new BadGatewayException(
+          `Zabbix агент не поддерживает ключ "${combo.zabbixKey}": ${foundItem.error || 'проверьте настройки агента'}`,
+        );
+      }
+
+      const lastclockNum = parseInt(foundItem.lastclock, 10) || 0;
+      if (lastclockNum === 0) {
+        pendingKeys.push(combo.zabbixKey);
       }
 
       const isOpen = foundItem.lastvalue === '1';
       const lastvalue: '1' | '0' = isOpen ? '1' : '0';
-      const lastclock = parseInt(foundItem.lastclock, 10) || nowUnix;
 
       socketResults.push({
         id: combo.id,
@@ -163,7 +170,7 @@ export class CheckerService {
         protocol: combo.protocol,
         zabbixKey: combo.zabbixKey,
         lastvalue,
-        lastclock,
+        lastclock: lastclockNum,
         status: isOpen ? 'accessible' : 'blocked',
       });
 
@@ -171,11 +178,21 @@ export class CheckerService {
         ? combo.destination
         : `${combo.destination}:${combo.port}`;
 
+      const timeStr =
+        lastclockNum > 0
+          ? new Date(lastclockNum * 1000).toLocaleTimeString()
+          : 'ожидает первого опроса кэша Zabbix';
+
       logLines.push(
-        `[${combo.protocol}] ${combo.source} -> ${destWithPort} (проверен IP: ${combo.cleanDestHost})\n` +
-          `  key_: "${combo.zabbixKey}" | lastvalue: "${lastvalue}" | lastclock: ${new Date(
-            lastclock * 1000,
-          ).toLocaleTimeString()}`,
+        `[${combo.protocol}] ${combo.source} -> ${destWithPort} (IP: ${combo.cleanDestHost})\n` +
+          `  key_: "${combo.zabbixKey}" | lastvalue: "${foundItem.lastvalue || 'пусто'}" | lastclock: ${timeStr}`,
+      );
+    }
+
+    // Если элементы были созданы впервые и Zabbix Server еще не обновил Configuration Cache (раз в 10-60 сек)
+    if (pendingKeys.length > 0) {
+      throw new BadGatewayException(
+        `Новые элементы данных (${pendingKeys.length} шт.) автоматически созданы в Zabbix, но Zabbix Server еще не обновил кэш конфигурации (CacheUpdateFrequency). Повторите нажатие через 10–15 секунд для получения результата.`,
       );
     }
 
@@ -189,7 +206,6 @@ export class CheckerService {
     };
   }
 
-  // 2. Режим эмуляции Zabbix API (работает ТОЛЬКО когда явно выбран режим mock)
   private async checkViaMock(combinations: RawCombination[]): Promise<CheckRuleResponseDto> {
     await new Promise((r) => setTimeout(r, 200 + Math.random() * 250));
 
