@@ -24,7 +24,7 @@ export interface ResolvedSourceTarget {
 
 export interface ItemSpec {
   key: string;
-  type: number; // 0 = Zabbix agent, 3 = Simple check
+  type: number; // 0 = Zabbix agent (passive), 7 = Zabbix agent (active)
 }
 
 interface ZabbixWritableHost {
@@ -43,7 +43,6 @@ interface ZabbixWritableHost {
   }>;
 }
 
-// Регулярное выражение для отсеивания VMware LLD объектов вида 500c2ba7-12e5-60df-99db-b1517f53651d
 const VMWARE_UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function ipToUint32(ip: string): number | null {
@@ -197,7 +196,9 @@ export class ZabbixApiService {
 
   private buildScannerInfo(host: ZabbixWritableHost): ScannerHostInfo {
     const agentInterface =
-      host.interfaces.find((i) => Number(i.type) === 1 && Number(i.main) === 1 && String(i.available) === '1') ||
+      host.interfaces.find(
+        (i) => Number(i.type) === 1 && Number(i.main) === 1 && String(i.available) === '1',
+      ) ||
       host.interfaces.find((i) => Number(i.type) === 1 && String(i.available) === '1') ||
       host.interfaces.find((i) => Number(i.type) === 1 && Number(i.main) === 1) ||
       host.interfaces.find((i) => Number(i.type) === 1)!;
@@ -215,16 +216,14 @@ export class ZabbixApiService {
     if (VMWARE_UUID_REGEX.test(host.host.trim())) {
       return false;
     }
-    return host.interfaces.some(
-      (i) => Number(i.type) === 1 && String(i.available) === '1',
-    );
+    return host.interfaces.some((i) => Number(i.type) === 1 && String(i.available) === '1');
   }
 
   async resolveSourceTarget(rawSource: string): Promise<ResolvedSourceTarget> {
     const cleaned = rawSource.trim();
     const agentHosts = await this.getWritableAgentHosts();
 
-    // 1. Source — подсеть CIDR (берем только узел с активным зеленым ZBX, исключая VMware UUID)
+    // 1. Source — подсеть CIDR (берем представителя с активным зеленым ZBX, исключая VMware UUID)
     const cidrMatch = cleaned.match(/(\d{1,3}(?:\.\d{1,3}){3}\/\d{1,2})/);
     if (cidrMatch) {
       const cidr = cidrMatch[1];
@@ -251,7 +250,7 @@ export class ZabbixApiService {
       };
     }
 
-    // 2. Source — диапазон IP (берем только узел с активным зеленым ZBX, исключая VMware UUID)
+    // 2. Source — диапазон IP (берем представителя с активным зеленым ZBX, исключая VMware UUID)
     const rangeMatch = cleaned.match(
       /(\d{1,3}(?:\.\d{1,3}){3})\s*[–-]\s*(\d{1,3}(?:\.\d{1,3}){3})/,
     );
@@ -282,7 +281,7 @@ export class ZabbixApiService {
       };
     }
 
-    // 3. Точный поиск конкретного узла Source по IP, FQDN или короткому имени
+    // 3. Точный поиск конкретного узла Source по IP, FQDN или видимому имени
     const parts = cleaned
       .split('/')
       .map((p) => p.trim().replace(/\.$/, '').toLowerCase())
@@ -294,7 +293,13 @@ export class ZabbixApiService {
 
     const searchTokens = new Set([...parts, ...shortNames]);
 
-    const matchedSourceHost = agentHosts.find((h) => {
+    const sortedHosts = [...agentHosts].sort((a, b) => {
+      const aIsVm = VMWARE_UUID_REGEX.test(a.host.trim()) ? 1 : 0;
+      const bIsVm = VMWARE_UUID_REGEX.test(b.host.trim()) ? 1 : 0;
+      return aIsVm - bIsVm;
+    });
+
+    const matchedSourceHost = sortedHosts.find((h) => {
       const hostTechnical = h.host.toLowerCase();
       const hostVisible = h.name.toLowerCase();
       const hostShort = hostTechnical.split('.')[0];

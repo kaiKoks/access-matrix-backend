@@ -1,4 +1,3 @@
-
 export interface PortGroupDto {
   raw?: string;
   list: string[];

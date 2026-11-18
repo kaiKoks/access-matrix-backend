@@ -8,6 +8,9 @@ export class MatrixSystemEntity {
   @Column({ type: 'varchar', length: 255 })
   name!: string;
 
+  @Column({ type: 'varchar', length: 128, nullable: true })
+  folderId!: string | null;
+
   @Column({ type: 'varchar', length: 64 })
   updatedAt!: string;
 

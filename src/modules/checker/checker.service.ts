@@ -99,7 +99,6 @@ export class CheckerService {
     return /^\d+$/.test(clean) ? [{ port: clean }] : [];
   }
 
-  // Формирует единые ключи net.tcp.port и net.udp.port для ВСЕХ портов без ограничений
   private buildCombinations(dto: CheckRuleRequestDto): RawCombination[] {
     const sources = dto.sources?.length ? dto.sources : ['LocalHost'];
     const destinations = dto.destinations?.length ? dto.destinations : ['Unknown'];
@@ -140,7 +139,6 @@ export class CheckerService {
     return combinations;
   }
 
-  // Резервная UDP-проверка сокетом для любого порта, если на Zabbix Agent еще не прописан UserParameter
   private probeUdpSocket(
     host: string,
     port: number,
@@ -178,16 +176,13 @@ export class CheckerService {
         }
       });
 
-      // Подбираем валидный пакет под популярные протоколы, чтобы служба гарантированно ответила
       let payload: Buffer;
       if (port === 53) {
-        // Стандартный DNS A-запрос для "."
         payload = Buffer.from([
           0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
           0x00, 0x00, 0x01, 0x00, 0x01,
         ]);
       } else if (port === 123) {
-        // Стандартный 48-байтный клиентский пакет NTP v3
         payload = Buffer.alloc(48);
         payload[0] = 0x1b;
       } else {
@@ -297,8 +292,6 @@ export class CheckerService {
 
       const isUnsupported = foundItem.state === '1';
 
-      // Если на Zabbix Agent еще не прописан UserParameter=net.udp.port[*],
-      // автоматически выполняем реальную проверку UDP-сокетом с бэкенда
       if (isUnsupported && combo.protocol === 'UDP') {
         const probe = await this.probeUdpSocket(combo.cleanDestHost, Number(combo.port));
         const nowSec = Math.floor(Date.now() / 1000);

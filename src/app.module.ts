@@ -6,6 +6,7 @@ import { AppService } from './app.service.js';
 import { CheckerModule } from './modules/checker/checker.module.js';
 import { CatalogModule } from './modules/catalog/catalog.module.js';
 import { MatrixSystemEntity } from './modules/catalog/entities/matrix-system.entity.js';
+import { MatrixFolderEntity } from './modules/catalog/entities/matrix-folder.entity.js';
 
 @Module({
   imports: [
@@ -16,7 +17,7 @@ import { MatrixSystemEntity } from './modules/catalog/entities/matrix-system.ent
       useFactory: (config: ConfigService): TypeOrmModuleOptions => ({
         type: 'better-sqlite3',
         database: config.get<string>('DATABASE_PATH', 'database.sqlite'),
-        entities: [MatrixSystemEntity],
+        entities: [MatrixSystemEntity, MatrixFolderEntity],
         synchronize: true,
       }),
     }),
